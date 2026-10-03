@@ -7,6 +7,7 @@ from .db import db_conn
 from .changes import insert_revision_changes, relation_diffs
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
+from .holds import assert_evidence_not_held
 from .models import AssertOp, BatchIn, RetractOp
 
 
@@ -92,6 +93,19 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
 
             # 变化追踪旧侧：本批次应用前的当时生效断言集（后来撤回的证据在旧侧仍生效）
             before_assertions = _load_active(cur)
+
+            # 临时保全拦截：本批撤回目标中任一证据仍被生效保全覆盖则整笔拒绝
+            # （在任何写入之前；多份保全覆盖同一证据时须全部解除才可撤回）。
+            retract_targets = [
+                op.evidence_id for op in batch.operations if isinstance(op, RetractOp)
+            ]
+            assert_evidence_not_held(
+                cur,
+                retract_targets,
+                code="EVIDENCE_HELD",
+                message="批次撤回目标中存在受临时保全覆盖的证据，整批拒绝，原状态不变",
+                extra={"expected_revision": current},
+            )
 
             for op in batch.operations:
                 if isinstance(op, AssertOp):

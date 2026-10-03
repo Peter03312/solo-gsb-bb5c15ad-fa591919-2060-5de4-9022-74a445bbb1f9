@@ -177,6 +177,31 @@ class FieldPackageCorrectionIn(BaseModel):
     assertions: List[FieldAssertionIn] = Field(min_length=1, description="带包内唯一序号的断言（端点只能用本包短号）")
 
 
+class HoldCreateIn(BaseModel):
+    """争议证据临时保全请求：携带当前正式修订号、一组不重复且均生效的证据编号与事由。
+
+    修订号过期按 STALE_REVISION 拒绝；证据编号重复按 HOLD_DUPLICATE_EVIDENCE 拒绝；
+    任一证据不存在或当前非生效按 INVALID_HOLD_EVIDENCE 整笔拒绝。保全建立不递增
+    正式修订、不改变既有断言与快照。成功响应含保全记录编号与仅在创建时显示一次的
+    解除凭据（后续任何查询均不再返回）。
+    """
+
+    expected_revision: int = Field(ge=0, description="当前正式修订号；不一致按 STALE_REVISION 拒绝")
+    evidence_ids: List[str] = Field(min_length=1, description="不重复且当前均生效的证据编号（至少一条）")
+    reason: str = Field(min_length=1, max_length=512, description="保全事由")
+
+
+class HoldReleaseIn(BaseModel):
+    """凭对应解除凭据解除指定保全；解除不递增正式修订。
+
+    保全不存在（404 HOLD_NOT_FOUND）、凭据错误（403 INVALID_HOLD_CREDENTIAL）、
+    已解除（409 HOLD_ALREADY_RELEASED）、修订号过期（409 STALE_REVISION）明确拒绝。
+    """
+
+    expected_revision: int = Field(ge=0, description="当前正式修订号；不一致按 STALE_REVISION 拒绝")
+    credential: str = Field(min_length=1, max_length=256, description="建立保全时一次性返回的解除凭据")
+
+
 class ResilienceIn(BaseModel):
     """证据撤回承受力分析请求（只读，不写库、不递增修订号、不产生变化记录）。
 

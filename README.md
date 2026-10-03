@@ -118,6 +118,104 @@
     勘误台账可读：`GET /field-packages/corrections`（可按 `terminal_id` 与
     `original_package_no` 过滤）与
     `GET /field-packages/corrections/{terminal_id}/{original_package_no}/{new_package_no}`。
+- **争议证据临时保全**：交接复核期间防止争议中的正式证据被撤回。
+  `POST /evidence-holds` 携带当前正式修订号 `expected_revision`、一组**不重复且当前均
+  生效**的证据编号 `evidence_ids` 与事由 `reason`；成功返回保全记录编号 `id`、保全状态、
+  每条证据当前的在保全来源，以及**仅在创建响应中显示一次**的解除凭据 `credential`
+  （明文不落库，库内只存 sha256 哈希；`GET /evidence-holds`、`GET /evidence-holds/{id}`
+  与 `GET /evidence-holds/evidence/{evidence_id}` 只返回状态、覆盖证据及每条证据的
+  生效保全来源，**永不回传凭据**）。保全建立 / 解除**不递增正式修订、不改变既有断言
+  与快照**。凭对应凭据 `POST /evidence-holds/{id}/release` 解除；明确拒绝：错误凭据
+  （403 `INVALID_HOLD_CREDENTIAL`）、证据不存在 / 非生效（400 `INVALID_HOLD_EVIDENCE`，
+  `details.invalid_evidence` 逐条给状态）、请求内编号重复
+  （400 `HOLD_DUPLICATE_EVIDENCE`）、过期修订（409 `STALE_REVISION`）、保全不存在
+  （404 `HOLD_NOT_FOUND`）、重复解除（409 `HOLD_ALREADY_RELEASED`）。
+  **多份保全覆盖同一证据时须全部解除才可撤回**：普通批次（409 `EVIDENCE_HELD`）、
+  野外包勘误（409 `FIELD_PACKAGE_EVIDENCE_HELD`）及推演并入（409 `MERGE_EVIDENCE_HELD`）
+  凡将受保全覆盖证据撤回到正式库均**整笔拒绝**，响应 `details` 返回命中的证据
+  `blocked_evidence` 及其全部生效保全记录，正式修订、包台账与推演状态均不变；
+  **推演内试验撤回不触碰正式库，仍可进行**。保全建立 / 解除与正式写入在事务内以
+  **同一顺序**（修订计数器行锁 `FOR UPDATE`）裁决，持锁后再做全部判定，无死锁、
+  不出现“撤回成功且保全仍生效”的交叉态。
+
+## 争议证据临时保全（交接复核期间冻结撤回入口）
+
+争议中的正式证据需要临时保全，避免交接复核期间被撤回。保全**只冻结撤回入口**，
+不改变证据本身、正式修订或任何既有快照。
+
+**建立保全**：`POST /evidence-holds`，请求携带当前正式修订号、一组不重复且当前均
+生效的证据编号与事由：
+
+```json
+{
+  "expected_revision": 3,
+  "evidence_ids": ["EV-002", "EV-005"],
+  "reason": "二期交接复核：H2-H5 关系链存疑，待原始档案核对"
+}
+```
+
+成功响应（HTTP 201）返回保全记录编号、状态、每条证据当前的在保全来源，以及
+**仅在创建时显示一次**的解除凭据 `credential`（请妥善转交；丢失后只能由库内哈希
+校验、无法找回明文）：
+
+```json
+{
+  "id": 7,
+  "revision": 3,
+  "current_revision": 3,
+  "reason": "二期交接复核：H2-H5 关系链存疑，待原始档案核对",
+  "status": "active",
+  "evidence_ids": ["EV-002", "EV-005"],
+  "evidences": [
+    {"evidence_id": "EV-002", "status": "active", "holds": [
+      {"id": 7, "revision": 3, "reason": "二期交接复核：…", "created_at": "…"}]},
+    {"evidence_id": "EV-005", "status": "active", "holds": [
+      {"id": 7, "revision": 3, "reason": "二期交接复核：…", "created_at": "…"}]}
+  ],
+  "credential": "rcZFvOdh0VEO9dDt4nrB4M27tdJqqWHqVep_8EKUM5w",
+  "created_at": "…"
+}
+```
+
+- **查询不泄露凭据**：`GET /evidence-holds`（可加 `?status=active|released`）、
+  `GET /evidence-holds/7` 返回保全状态、覆盖证据及每条证据**当前**的在保全来源
+  （同一证据可能同时被多份保全覆盖，`holds` 给出全部生效保全），
+  `GET /evidence-holds/evidence/EV-002` 按证据反查；任何查询响应都不含 `credential`。
+- **撤回拦截**：保全期间正式写入路径上的撤回整笔拒绝，并返回命中的证据与保全记录：
+
+| 路径 | 拒绝码 |
+| --- | --- |
+| `POST /batches`（普通批次撤回归档） | 409 `EVIDENCE_HELD` |
+| `POST /field-packages/corrections`（勘误撤回原包证据） | 409 `FIELD_PACKAGE_EVIDENCE_HELD` |
+| `POST /projections/{id}/merge`（并入撤回基线证据） | 409 `MERGE_EVIDENCE_HELD` |
+
+  拒绝体 `details.blocked_evidence[]` 形如
+  `[{"evidence_id": "EV-002", "holds": [{"id": 7, "revision": 3, "reason": "…", "created_at": "…"}]}]`，
+  并附 `blocked_evidence_ids` 与 `current_revision`；整笔拒绝意味着同批中未受保的
+  其他撤回也不生效，**正式修订、断言、包台账与推演状态全部不变**。
+  **推演内试验撤回**（`POST /projections/{id}/batches`）不写正式库，仍可进行；
+  其并入尝试会被 `MERGE_EVIDENCE_HELD` 拦截、推演保持 open。
+- **多份保全覆盖同一证据须全部解除**：每份保全有独立凭据，只有覆盖该证据的全部
+  生效保全都解除后，撤回才可进行。解除 `POST /evidence-holds/7/release`：
+
+```json
+{"expected_revision": 3, "credential": "rcZFvOdh0VEO9dDt4nrB4M27tdJqqWHqVep_8EKUM5w"}
+```
+
+  成功返回 `{"id": 7, "status": "released", "revision": 3, "current_revision": 3, …}`
+  （不递增正式修订）。错误凭据 403 `INVALID_HOLD_CREDENTIAL`、保全不存在 404
+  `HOLD_NOT_FOUND`、重复解除 409 `HOLD_ALREADY_RELEASED`、修订号过期 409
+  `STALE_REVISION`，均不改变任何状态。已解除保全保留 `released` 留痕。
+- **并发裁决**：保全建立 / 解除与正式批次 / 勘误 / 并入在各自事务内以**相同顺序**
+  锁定修订计数器行（`SELECT … FOR UPDATE`），取锁后再完成全部校验与写入：并发
+  请求按同一个全序串行裁决，终态必然自洽——保全先建则并发撤回收到
+  `EVIDENCE_HELD`；撤回先成则并发建保全收到 `INVALID_HOLD_EVIDENCE`（证据已非生效），
+  不会出现“撤回成功且保全仍生效”或两者都落空。保全操作只锁计数器、不更新其值，
+  **不递增正式修订**，也不改变既有断言、定版快照与推演冻结视图。
+
+```bash
+bash examples/evidence_holds_demo.sh
+```
 
 ## 快速开始
 
@@ -158,6 +256,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/field-packages` | 野外终端离线整包汇入：短号对照建层/绑定、稳定证据编号、整批核验、幂等返回原结果 |
 | POST | `/field-packages/corrections` | 已汇入整包勘误：单事务撤回原包证据 + 新包号汇入 + 最终核验；成功只 +1 修订、记录替换链 |
 | GET | `/field-packages/corrections` / `/field-packages/corrections/{terminal_id}/{original_package_no}/{new_package_no}` | 勘误台账列表（可按终端/原包过滤）/ 单条勘误详情（撤回证据与首次勘误响应） |
+| POST | `/evidence-holds` | 争议证据临时保全：携带当前修订号、不重复且均生效的证据编号与事由；返回保全编号与仅显示一次的解除凭据（不递增修订） |
+| GET | `/evidence-holds` / `/evidence-holds/{id}` | 保全台账列表（可按状态过滤）/ 单份保全状态与每条证据的在保全来源（均不泄露凭据） |
+| GET | `/evidence-holds/evidence/{evidence_id}` | 按证据编号反查：是否在保全中、生效保全数与全部生效保全来源 |
+| POST | `/evidence-holds/{id}/release` | 凭对应凭据解除指定保全（错误凭据 403；不递增修订） |
 | GET | `/field-packages` / `/field-packages/{terminal_id}/{package_no}` | 野外汇入包台账列表 / 详情（内容指纹与首次响应；已替换包带 status/替换链；终端或包号含 `/` 等路径保留字符时用 `/field-packages?terminal_id=...&package_no=...`） |
 | POST | `/batches/preflight` | 提交前只读预检：求消除冲突所需撤回的最少生效旧证据（预算 0～3），不落库 |
 | GET | `/revision` | 当前修订号 |
@@ -844,6 +946,14 @@ bash examples/arrangement_demo.sh
 | 409 | `FIELD_CORRECTION_CONTENT_MISMATCH` | 野外包勘误：同原包同新包已以不同内容勘误成功，异内容复用拒绝 |
 | 404 | `FIELD_CORRECTION_NOT_FOUND` | 勘误台账中不存在该 (终端, 原包号, 新包号) |
 | 404 | `FIELD_PACKAGE_NOT_FOUND` | 野外汇入包台账中不存在该终端 + 包号（勘误原包不存在同码） |
+| 400 | `HOLD_DUPLICATE_EVIDENCE` | 临时保全：请求中的证据编号重复 |
+| 400 | `INVALID_HOLD_EVIDENCE` | 临时保全：证据不存在或当前非生效（details.invalid_evidence 逐条给状态） |
+| 404 | `HOLD_NOT_FOUND` | 临时保全：保全记录不存在 |
+| 403 | `INVALID_HOLD_CREDENTIAL` | 临时保全：解除凭据错误 |
+| 409 | `HOLD_ALREADY_RELEASED` | 临时保全：保全已解除，重复解除拒绝 |
+| 409 | `EVIDENCE_HELD` | 普通批次撤回目标仍被生效临时保全覆盖（整批拒绝，details 给命中证据与保全记录） |
+| 409 | `FIELD_PACKAGE_EVIDENCE_HELD` | 野外包勘误将撤回受保全覆盖的原包证据（整笔拒绝，台账/修订不变） |
+| 409 | `MERGE_EVIDENCE_HELD` | 推演并入将把受保全覆盖证据撤回到正式库（并入拒绝，正式与推演均不变） |
 
 ## 正式修订关系变化追踪
 
@@ -1280,6 +1390,14 @@ bash examples/field_packages_demo.sh
 bash examples/field_package_corrections_demo.sh
 ```
 
+争议证据临时保全演示（一次性解除凭据、查询不泄露凭据、多份保全覆盖须全部解除、
+普通批次 / 野外包勘误 / 推演并入撤回整笔拒绝附命中证据与保全记录、推演内试验撤回
+仍可进行、错误凭据 / 无效证据 / 过期修订 / 重复解除明确拒绝、保全不递增修订）：
+
+```bash
+bash examples/evidence_holds_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -1294,6 +1412,7 @@ app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
   field.py        # 野外终端离线整包汇入与勘误替换：短号建层/跨包绑定、稳定证据编号、整批核验、包台账幂等、撤回替换链
+  holds.py        # 争议证据临时保全：一次性解除凭据（哈希存证）、生效保全来源查询、正式撤回三路径拦截、行锁同序裁决
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
@@ -1317,6 +1436,7 @@ examples/
   package_reconciliation_demo.sh # 成果包交付前复核示例（三类比较/首次偏离/曾偏离保留/只读拒绝）
   field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
   field_package_corrections_demo.sh # 已汇入整包勘误示例（撤回+新包单事务/幂等/替换链/台账/冲突回滚/历史可查）
+  evidence_holds_demo.sh # 争议证据临时保全示例（一次性凭据/状态与来源查询/多保全重叠/撤回拦截三路径/推演内撤回不受限）
   client_demo.py    # Python 客户端示例
 Dockerfile
 docker-compose.yml

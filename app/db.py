@@ -215,6 +215,32 @@ CREATE TABLE IF NOT EXISTS field_package_corrections (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (terminal_id, original_package_no, new_package_no)
 );
+
+-- 争议证据临时保全：交接复核期间防止被撤回。保全建立 / 解除只锁修订计数器行
+-- （与正式写入一致的裁决顺序），不递增正式修订、不改既有断言与快照。
+-- 解除凭据仅在创建响应中明文给出一次，库里只存 sha256 哈希（credential_hash），
+-- 任何查询接口都不返回凭据或其哈希。保全行解除后保留留痕（status=released）。
+CREATE TABLE IF NOT EXISTS evidence_holds (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    revision        INTEGER NOT NULL,                     -- 建立时的当前正式修订号（不随正式修订前进）
+    reason          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'released')),
+    credential_hash TEXT NOT NULL,                        -- 解除凭据的 sha256 哈希；凭据本身不落库、不回查
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    released_at     TIMESTAMPTZ
+);
+
+-- 每份保全覆盖的证据（建立时逐条核验为当前生效证据；保全不随证据后续状态变化而移动）。
+-- 同一证据可同时被多份生效保全覆盖，须全部解除后该证据才可被正式写入撤回。
+CREATE TABLE IF NOT EXISTS evidence_hold_items (
+    hold_id     BIGINT NOT NULL REFERENCES evidence_holds(id),
+    evidence_id TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (hold_id, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_hold_items_evidence
+    ON evidence_hold_items (evidence_id, hold_id);
 """
 
 # revision_changes.source 增加 field_package（野外整包汇入）。

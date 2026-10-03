@@ -22,6 +22,7 @@ from .db import db_conn
 from .changes import insert_revision_changes, relation_diffs
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
+from .holds import assert_evidence_not_held
 from .models import AssertOp, ProjectionBatchIn, RetractOp
 
 
@@ -522,6 +523,16 @@ def merge_projection(projection_id: int) -> Dict[str, Any]:
             # ---- 净变更 ----
             net_added = [a for a in added if a["status"] == "active"]
             net_retracted = [r for r in retracted if r["evidence_id"] in base_ids]
+
+            # ---- 临时保全拦截：并入将撤回的基线证据中任一仍被生效保全覆盖，
+            # 并入整笔拒绝（推演内试验撤回不受限；须全部生效保全解除后才可并入撤回）----
+            assert_evidence_not_held(
+                cur,
+                [r["evidence_id"] for r in net_retracted],
+                code="MERGE_EVIDENCE_HELD",
+                message="并入将把受临时保全覆盖的证据撤回到正式库，并入拒绝，正式状态与推演均不变",
+                extra={"projection_id": projection_id, "base_revision": proj["base_revision"]},
+            )
 
             # ---- 针对最新正式状态的结构核验（fail-fast，给出具体原因）----
             for r in net_retracted:

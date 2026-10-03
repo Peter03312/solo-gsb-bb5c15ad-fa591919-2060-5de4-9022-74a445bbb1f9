@@ -35,6 +35,7 @@ from .changes import insert_revision_changes, relation_diffs
 from .db import db_conn
 from .derivation import Assertion, Derivation
 from .errors import ApiError
+from .holds import assert_evidence_not_held
 from .models import FieldPackageCorrectionIn, FieldPackageIn
 
 SEQ_WIDTH = 12  # 序号补零宽度：稳定且字典序友好（上限 10**12-1，由模型 ge=1 与上层约束共同保证）
@@ -657,6 +658,21 @@ def correct_field_package(body: FieldPackageCorrectionIn) -> Dict[str, Any]:
                         "inactive_evidence": inactive,
                     },
                 )
+
+            # ---- 临时保全拦截：原包证据中任一仍被生效保全覆盖，勘误整笔拒绝 ----
+            # （须全部生效保全解除后才可撤回；计数器行锁已持有，与保全操作同序裁决）
+            assert_evidence_not_held(
+                cur,
+                original_evidence_ids,
+                code="FIELD_PACKAGE_EVIDENCE_HELD",
+                message="原包证据存在受临时保全覆盖者，勘误（撤回原包证据到正式库）整笔拒绝；"
+                "请先解除相关保全",
+                extra={
+                    "terminal_id": body.terminal_id,
+                    "original_package_no": body.original_package_no,
+                    "new_package_no": body.new_package_no,
+                },
+            )
 
             audit_operations = [
                 {

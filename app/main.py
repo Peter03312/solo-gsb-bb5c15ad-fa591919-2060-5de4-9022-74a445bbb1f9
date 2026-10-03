@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, reconciliation, resilience, service
+from . import arrangement as arrangement_svc, changes, db, field as field_svc, holds as holds_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, reconciliation, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, FieldPackageCorrectionIn, FieldPackageIn, PackageIn, PackageReconcileIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, FieldPackageCorrectionIn, FieldPackageIn, HoldCreateIn, HoldReleaseIn, PackageIn, PackageReconcileIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -46,7 +46,15 @@ app = FastAPI(
         "支持成果包交付前只读复核（POST /packages/{id}/reconcile）："
         "在同一只读快照视图中逐项比较包内封存关系结论与最优证据路径和当前正式结果"
         "（结论改变 / 仅路径改变 / 完全一致），并给出每对自封存修订后首次偏离的"
-        "修订号与变化来源（已恢复一致也保留曾偏离记录），不改写成果包、断言或修订。"
+        "修订号与变化来源（已恢复一致也保留曾偏离记录），不改写成果包、断言或修订；"
+        "支持争议证据临时保全（/evidence-holds）："
+        "携带当前正式修订号、一组不重复且均生效的证据编号与事由建立保全，"
+        "返回保全记录编号与仅在创建时显示一次的解除凭据；查询可见保全状态与每条证据"
+        "的在保全来源但不泄露凭据；凭凭据解除，错误凭据 / 无效证据 / 过期修订明确拒绝；"
+        "同一证据须全部生效保全解除后才可撤回——普通批次、野外包勘误及推演并入"
+        "凡撤回受保全覆盖证据均整笔拒绝并返回命中的证据与保全记录（推演内试验撤回不受限）；"
+        "保全建立 / 解除与正式写入按一致顺序（修订计数器行锁）裁决，"
+        "保全本身不递增正式修订、不改变既有断言与快照。"
     ),
     lifespan=lifespan,
 )
@@ -160,6 +168,58 @@ def list_assertions(status: Optional[str] = Query(default=None, pattern="^(activ
                 }
                 for r in cur.fetchall()
             ]
+
+
+# ------------------------------------------------------------------ 争议证据临时保全
+@app.post("/evidence-holds", status_code=201, tags=["evidence-holds"])
+def create_evidence_hold(body: HoldCreateIn):
+    """为争议中的正式证据建立临时保全，避免交接复核期间被撤回。
+
+    - 请求携带当前正式修订号 expected_revision、一组不重复且当前均生效的证据编号
+      evidence_ids 与事由 reason；
+    - 成功返回保全记录编号 id、保全状态与每条证据当前的在保全来源（含本次保全），
+      以及**仅在创建时显示一次**的解除凭据 credential（明文不落库，查询不再返回）；
+    - 明确拒绝：修订号过期（409 STALE_REVISION，details.current_revision）、
+      证据编号在请求内重复（400 HOLD_DUPLICATE_EVIDENCE）、任一证据不存在或当前
+      非生效（400 INVALID_HOLD_EVIDENCE，details.invalid_evidence 逐条给状态）；
+    - 保全建立不递增正式修订、不改变既有断言与任何快照。
+    """
+    return holds_svc.create_hold(body)
+
+
+@app.get("/evidence-holds", tags=["evidence-holds"])
+def list_evidence_holds(
+    status: Optional[str] = Query(default=None, pattern="^(active|released)$", description="按保全状态过滤（默认全部）"),
+):
+    """保全台账摘要（可按 active/released 过滤）；任何情况下都不返回解除凭据。"""
+    return holds_svc.list_holds(status)
+
+
+@app.get("/evidence-holds/evidence/{evidence_id}", tags=["evidence-holds"])
+def get_evidence_holds_for_evidence(evidence_id: str):
+    """按证据编号反查：证据是否在保全中、生效保全数与全部生效保全来源（不含凭据）。
+
+    证据编号未知（无此断言）时返回 evidence_status=null、held=false（HTTP 200）。
+    """
+    return holds_svc.get_holds_for_evidence(evidence_id)
+
+
+@app.get("/evidence-holds/{hold_id}", tags=["evidence-holds"])
+def get_evidence_hold(hold_id: int):
+    """单份保全详情：状态、覆盖证据及每条证据当前的在保全来源（不泄露解除凭据）。"""
+    return holds_svc.get_hold(hold_id)
+
+
+@app.post("/evidence-holds/{hold_id}/release", tags=["evidence-holds"])
+def release_evidence_hold(hold_id: int, body: HoldReleaseIn):
+    """凭对应解除凭据解除指定保全（不递增正式修订）。
+
+    同一证据被多份保全覆盖时须全部解除后才可撤回。明确拒绝：
+    保全不存在（404 HOLD_NOT_FOUND）、凭据错误（403 INVALID_HOLD_CREDENTIAL）、
+    已解除（409 HOLD_ALREADY_RELEASED）、修订号过期（409 STALE_REVISION）。
+    """
+    return holds_svc.release_hold(hold_id, body)
+
 
 
 # ------------------------------------------------------------------ 野外终端离线整包汇入
