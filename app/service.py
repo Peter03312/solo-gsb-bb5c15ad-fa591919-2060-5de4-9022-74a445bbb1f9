@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from psycopg2.extras import Json
 
+from . import preservations
 from .db import db_conn
 from .changes import insert_revision_changes, relation_diffs
 from .derivation import Assertion, Derivation, RELATION_LABELS
@@ -134,6 +135,12 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
                         "WHERE evidence_id = %s",
                         (new_revision, op.evidence_id),
                     )
+
+            # 受保全证据不得撤回：命中即整批拒绝（事务回滚，原状态不变），
+            # 返回命中的证据与覆盖它的生效保全记录
+            preservations.raise_if_preserved(
+                cur, [op.evidence_id for op in batch.operations if isinstance(op, RetractOp)]
+            )
 
             # 对整批应用后的最终关系核验
             after_assertions = _load_active(cur)

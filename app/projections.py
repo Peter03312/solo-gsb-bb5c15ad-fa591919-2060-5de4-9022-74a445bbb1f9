@@ -23,6 +23,7 @@ from .changes import insert_revision_changes, relation_diffs
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
 from .models import AssertOp, ProjectionBatchIn, RetractOp
+from . import preservations
 
 
 # ------------------------------------------------------------------ 工具
@@ -556,6 +557,13 @@ def merge_projection(projection_id: int) -> Dict[str, Any]:
                             "current_revision": current,
                         },
                     )
+
+            # ---- 受保全证据不得并入撤回：整笔拒绝，正式状态与推演均不变 ----
+            preservations.raise_if_preserved(
+                cur,
+                [r["evidence_id"] for r in net_retracted],
+                {"projection_id": projection_id},
+            )
 
             # ---- 对净变更应用后的最新正式状态做关系核验 ----
             formal = _formal_active(cur)

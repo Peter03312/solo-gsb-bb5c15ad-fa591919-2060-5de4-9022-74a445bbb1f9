@@ -261,6 +261,31 @@ ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_by_package_no TEX
 ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
 """
 
+# 争议证据临时保全：交接复核期间防止生效证据被撤回。
+# 保全记录只增不删，解除仅置状态（released）全程留痕；解除凭据只存 sha256 摘要
+# （不明文落库，任何查询接口不下发）；建立 / 解除都不递增正式修订号、不改变既有快照。
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS evidence_preservations (
+    id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    reason            TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released')),
+    credential_hash   TEXT NOT NULL,                     -- 解除凭据的 sha256 摘要（不明文存储）
+    created_revision  INTEGER NOT NULL,                  -- 建立时的正式修订号（留痕，不递增）
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    released_revision INTEGER,                           -- 解除时的正式修订号（留痕，不递增）
+    released_at       TIMESTAMPTZ
+);
+
+-- 保全覆盖的证据清单：同一证据可被多份保全覆盖，须全部解除后才可撤回。
+CREATE TABLE IF NOT EXISTS evidence_preservation_items (
+    preservation_id BIGINT NOT NULL REFERENCES evidence_preservations(id),
+    evidence_id     TEXT NOT NULL,
+    PRIMARY KEY (preservation_id, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_preservation_items_evidence
+    ON evidence_preservation_items (evidence_id);
+"""
+
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None
 
 

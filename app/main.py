@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, reconciliation, resilience, service
+from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, preservations as preservations_svc, projections, reconciliation, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, FieldPackageCorrectionIn, FieldPackageIn, PackageIn, PackageReconcileIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, FieldPackageCorrectionIn, FieldPackageIn, PackageIn, PackageReconcileIn, PreflightIn, PreservationIn, PreservationReleaseIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -47,6 +47,10 @@ app = FastAPI(
         "在同一只读快照视图中逐项比较包内封存关系结论与最优证据路径和当前正式结果"
         "（结论改变 / 仅路径改变 / 完全一致），并给出每对自封存修订后首次偏离的"
         "修订号与变化来源（已恢复一致也保留曾偏离记录），不改写成果包、断言或修订。"
+        "支持争议证据临时保全（/preservations）：对一组不重复且均生效的证据建立保全，"
+        "返回保全编号与仅创建时显示的解除凭据（查询不泄露凭据）；同一证据被多份保全"
+        "覆盖时须全部解除才可撤回——普通批次、野外包勘误与推演并入凡将受保全证据撤回"
+        "到正式库均整笔拒绝（附命中证据与保全记录），保全操作不递增正式修订号。"
     ),
     lifespan=lifespan,
 )
@@ -464,6 +468,53 @@ def post_package_reconcile(package_id: int, body: PackageReconcileIn):
     （details.current_revision）；全程在 REPEATABLE READ READ ONLY 快照事务内完成。
     """
     return reconciliation.reconcile_package(package_id, body)
+
+
+# ------------------------------------------------------------------ 争议证据临时保全
+@app.post("/preservations", status_code=201, tags=["preservations"])
+def post_preservation(body: PreservationIn):
+    """建立争议证据临时保全（交接复核期间防止生效证据被撤回）。
+
+    - 携带当前正式修订号、一组**不重复且均生效**的证据编号与事由；
+      空集合 400 EMPTY_EVIDENCE、申请内重复 400 DUPLICATE_EVIDENCE、
+      证据不存在或非生效 400 INVALID_PRESERVATION_EVIDENCE
+      （details 区分 not_found / not_active）、过期修订 409 STALE_REVISION；
+    - 成功返回保全记录编号与**仅在创建时显示**的解除凭据（库中只存摘要，
+      任何查询接口不返回凭据）；同一证据可被多份保全覆盖；
+    - 保全建立不递增正式修订号、不改变既有快照；与正式写入共用同一
+      修订计数器行锁，并发按一致次序裁决。
+    """
+    return preservations_svc.create_preservation(body)
+
+
+@app.get("/preservations", tags=["preservations"])
+def list_preservations(
+    status: Optional[str] = Query(default=None, pattern="^(active|released)$", description="按状态过滤"),
+    evidence_id: Optional[str] = Query(default=None, description="只列出覆盖该证据的保全（每条证据的在保来源）"),
+):
+    """保全台账列表：可见每份保全的状态与覆盖证据，**不泄露解除凭据**。
+
+    给 evidence_id 时返回该证据的全部在保来源（含已解除的历史保全，
+    可配合 status=active 只看仍生效的覆盖）。
+    """
+    return preservations_svc.list_preservations(status=status, evidence_id=evidence_id)
+
+
+@app.get("/preservations/{preservation_id}", tags=["preservations"])
+def get_preservation(preservation_id: int):
+    """保全详情：状态、事由、覆盖证据、建立 / 解除修订号（不存在 404，不含凭据）。"""
+    return preservations_svc.get_preservation(preservation_id)
+
+
+@app.post("/preservations/{preservation_id}/release", tags=["preservations"])
+def post_preservation_release(preservation_id: int, body: PreservationReleaseIn):
+    """凭创建时下发的解除凭据解除指定保全。
+
+    保全不存在 404 PRESERVATION_NOT_FOUND、已解除 409 PRESERVATION_ALREADY_RELEASED、
+    过期修订 409 STALE_REVISION、错误凭据 403 PRESERVATION_CREDENTIAL_MISMATCH；
+    解除不递增正式修订号。同一证据被多份保全覆盖时，须全部解除后才可撤回。
+    """
+    return preservations_svc.release_preservation(preservation_id, body)
 
 
 # ------------------------------------------------------------------ 推演（证据修订沙盘）

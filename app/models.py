@@ -193,3 +193,29 @@ class ResilienceIn(BaseModel):
         default_factory=list,
         description="受保护生效证据编号集合（可为空；自动去重；须为当前生效证据，否则拒绝）",
     )
+
+
+class PreservationIn(BaseModel):
+    """争议证据临时保全申请：携带当前正式修订号、一组不重复且均生效的证据编号与事由。
+
+    成功返回保全记录编号与**仅在创建时显示**的解除凭据（库中只存摘要，查询接口
+    不泄露凭据）；保全本身不递增正式修订号、不改变既有快照。
+    """
+
+    expected_revision: int = Field(ge=0, description="当前正式修订号；不一致则按 STALE_REVISION 拒绝")
+    evidence_ids: List[str] = Field(
+        description="受保全证据编号（不重复、均须为生效证据；空集合 / 重复 / 无效编号明确拒绝）",
+    )
+    reason: str = Field(min_length=1, max_length=512, description="保全事由")
+
+
+class PreservationReleaseIn(BaseModel):
+    """解除指定保全：凭创建时下发的解除凭据与当前正式修订号。
+
+    错误凭据（403 PRESERVATION_CREDENTIAL_MISMATCH）、保全不存在
+    （404 PRESERVATION_NOT_FOUND）、已解除（409 PRESERVATION_ALREADY_RELEASED）、
+    过期修订（409 STALE_REVISION）均明确拒绝；解除不递增正式修订号。
+    """
+
+    expected_revision: int = Field(ge=0, description="当前正式修订号；不一致则按 STALE_REVISION 拒绝")
+    credential: str = Field(min_length=1, max_length=256, description="创建保全时下发的解除凭据")

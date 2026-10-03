@@ -36,6 +36,7 @@ from .db import db_conn
 from .derivation import Assertion, Derivation
 from .errors import ApiError
 from .models import FieldPackageCorrectionIn, FieldPackageIn
+from . import preservations
 
 SEQ_WIDTH = 12  # 序号补零宽度：稳定且字典序友好（上限 10**12-1，由模型 ge=1 与上层约束共同保证）
 
@@ -657,6 +658,17 @@ def correct_field_package(body: FieldPackageCorrectionIn) -> Dict[str, Any]:
                         "inactive_evidence": inactive,
                     },
                 )
+
+            # ---- 原包证据不得仍在保全中（受保全证据须先解除全部保全才可撤回）----
+            preservations.raise_if_preserved(
+                cur,
+                original_evidence_ids,
+                {
+                    "terminal_id": body.terminal_id,
+                    "original_package_no": body.original_package_no,
+                    "new_package_no": body.new_package_no,
+                },
+            )
 
             audit_operations = [
                 {

@@ -118,6 +118,13 @@
     勘误台账可读：`GET /field-packages/corrections`（可按 `terminal_id` 与
     `original_package_no` 过滤）与
     `GET /field-packages/corrections/{terminal_id}/{original_package_no}/{new_package_no}`。
+- **争议证据临时保全**：交接复核期间可对一组（不重复、均生效）正式证据建立临时保全
+  （携带当前正式修订号与事由）；成功返回保全记录编号与**仅在创建时显示**的解除凭据
+  （库中只存凭据摘要，查询接口不泄露凭据）。同一证据可被多份保全覆盖，须**全部**解除
+  后才可撤回：普通批次、野外包勘误与推演并入凡将受保全证据撤回到正式库均**整笔拒绝**
+  （409 `EVIDENCE_PRESERVED`，附命中证据与保全记录），正式修订、台账与推演状态不变；
+  推演内试验撤回仍可进行。保全建立 / 解除与正式写入共用同一修订计数器行锁，并发按
+  一致次序裁决；保全操作本身不递增正式修订号、不改变既有快照。
 
 ## 快速开始
 
@@ -180,6 +187,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}` |
 | POST | `/packages/{id}/reconcile` | 成果包交付前只读复核：逐对比较封存关系/最优路径与当前结果（结论改变/仅路径改变/完全一致），附首次偏离修订号与来源 |
 | GET | `/packages` / `/packages/{id}` | 成果包列表 / 成果包详情（冻结内容与内容指纹） |
+| POST | `/preservations` | 建立争议证据临时保全：携带当前修订号 + 不重复且均生效的证据编号 + 事由；返回保全编号与仅创建时显示的解除凭据 |
+| GET | `/preservations` / `/preservations/{id}` | 保全列表（可按 `status` / `evidence_id` 过滤）/ 详情；可见状态与每条证据的在保来源，不泄露凭据 |
+| POST | `/preservations/{id}/release` | 凭解除凭据 + 当前修订号解除指定保全；错误凭据 / 已解除 / 过期修订明确拒绝 |
 
 ### 批次请求格式
 
@@ -509,6 +519,87 @@ field_package_correction`（含原 / 新包号与撤回证据清单），`/revis
 
 ```bash
 bash examples/field_package_corrections_demo.sh
+```
+
+### 争议证据临时保全：`POST /preservations`
+
+争议中的正式证据在交接复核期间需要临时保全，避免被撤回。申请携带**当前正式修订号**、
+一组**不重复且均生效**的证据编号与事由：
+
+```json
+{
+  "expected_revision": 1,
+  "evidence_ids": ["EV-001", "EV-002"],
+  "reason": "争议证据交接复核"
+}
+```
+
+成功响应（HTTP 201）返回保全记录编号与**仅在创建时显示**的解除凭据
+（库中只存凭据的 sha256 摘要，任何查询接口都不返回凭据或摘要）：
+
+```json
+{
+  "id": 1,
+  "status": "active",
+  "reason": "争议证据交接复核",
+  "evidence_ids": ["EV-001", "EV-002"],
+  "created_revision": 1,
+  "created_at": "2026-10-03T16:40:27.500350+00:00",
+  "release_credential": "it6QKKG4AOBY46v-2UIqYlA-6VYkg5ZHmEXCra35x2A"
+}
+```
+
+**查询（不泄露凭据）**
+
+- `GET /preservations`：台账列表，可按 `?status=active|released` 过滤；
+  按 `?evidence_id=EV-001` 过滤时返回该证据的**全部在保来源**（含已解除的历史保全）；
+- `GET /preservations/{id}`：单条详情（不存在 404 `PRESERVATION_NOT_FOUND`）；
+- 响应只含 `id / status / reason / evidence_ids / created_revision / created_at /
+  released_revision / released_at`，**永不含**解除凭据或其摘要。
+
+**解除**：`POST /preservations/{id}/release`，请求体携带解除凭据与当前正式修订号：
+
+```json
+{"expected_revision": 1, "credential": "it6QKKG4AOBY46v-2UIqYlA-6VYkg5ZHmEXCra35x2A"}
+```
+
+- 错误凭据 403 `PRESERVATION_CREDENTIAL_MISMATCH`、保全已解除
+  409 `PRESERVATION_ALREADY_RELEASED`、过期修订 409 `STALE_REVISION`、
+  保全不存在 404 `PRESERVATION_NOT_FOUND` 均明确拒绝；
+- 解除只置状态（`released`）并留痕解除时的正式修订号，**不递增正式修订号**。
+
+**撤回拦截**：同一证据可被多份保全覆盖，须**全部**解除后才可撤回。普通批次
+（`POST /batches`）、野外包勘误（`POST /field-packages/corrections`）与推演并入
+（`POST /projections/{id}/merge`）凡将受保全证据撤回到正式库，均**整笔拒绝**
+（HTTP 409 `EVIDENCE_PRESERVED`），返回命中的证据与覆盖它的生效保全记录，
+正式修订、台账与推演状态不变：
+
+```json
+{
+  "error": {
+    "code": "EVIDENCE_PRESERVED",
+    "message": "证据仍处于保全状态，须解除覆盖它的全部保全后才可撤回，整笔拒绝，原状态不变",
+    "details": {
+      "preserved_evidence": [
+        {"evidence_id": "EV-001",
+         "preservations": [{"id": 1, "reason": "争议证据交接复核",
+                            "created_revision": 1, "created_at": "..."}]}
+      ]
+    }
+  }
+}
+```
+
+推演**内**的试验撤回（`POST /projections/{id}/batches` 撤回基线证据）不触碰正式库，
+仍可进行；只有并入正式库时才受保全拦截。
+
+**并发与一致性**：保全建立 / 解除与正式写入（批次、勘误、并入）共用同一正式修订
+计数器行锁，并发下按一致的先后次序裁决——先提交的保全使随后的撤回整笔拒绝，
+先提交的正式写入使随后的保全申请 / 解除因修订号过期而拒绝。保全操作本身不递增
+正式修订号、不改变既有快照与台账。
+
+```bash
+bash examples/preservations_demo.sh
 ```
 
 ### 关系查询响应
@@ -844,6 +935,13 @@ bash examples/arrangement_demo.sh
 | 409 | `FIELD_CORRECTION_CONTENT_MISMATCH` | 野外包勘误：同原包同新包已以不同内容勘误成功，异内容复用拒绝 |
 | 404 | `FIELD_CORRECTION_NOT_FOUND` | 勘误台账中不存在该 (终端, 原包号, 新包号) |
 | 404 | `FIELD_PACKAGE_NOT_FOUND` | 野外汇入包台账中不存在该终端 + 包号（勘误原包不存在同码） |
+| 400 | `EMPTY_EVIDENCE` | 证据保全：申请内证据编号集合为空 |
+| 400 | `DUPLICATE_EVIDENCE` | 证据保全：申请内证据编号重复 |
+| 400 | `INVALID_PRESERVATION_EVIDENCE` | 证据保全：证据不存在或非生效（`details` 区分 `not_found` / `not_active`） |
+| 404 | `PRESERVATION_NOT_FOUND` | 证据保全：保全记录不存在 |
+| 409 | `PRESERVATION_ALREADY_RELEASED` | 证据保全：保全已解除，不可重复解除 |
+| 403 | `PRESERVATION_CREDENTIAL_MISMATCH` | 证据保全：解除凭据错误 |
+| 409 | `EVIDENCE_PRESERVED` | 批次 / 野外勘误 / 推演并入：撤回目标仍被生效保全覆盖（`details` 附命中证据与保全记录），整笔拒绝 |
 
 ## 正式修订关系变化追踪
 
@@ -1280,6 +1378,14 @@ bash examples/field_packages_demo.sh
 bash examples/field_package_corrections_demo.sh
 ```
 
+争议证据临时保全演示（建立保全与仅创建时显示的解除凭据、查询不泄露凭据、
+多份保全覆盖同一证据须全部解除、普通批次 / 野外包勘误 / 推演并入撤回受保全证据整笔拒绝、
+错误凭据 / 已解除 / 过期修订 / 无效证据明确拒绝、保全操作不递增修订号且既有快照不变）：
+
+```bash
+bash examples/preservations_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -1298,6 +1404,7 @@ app/
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   reconciliation.py # 成果包交付前只读复核：封存结论/最优路径与当前结果逐项比较、首次偏离追溯
+  preservations.py # 争议证据临时保全：建立/查询/解除（凭据仅创建时显示），撤回拦截（批次/勘误/并入）
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
   arrangement.py   # 分期试排（只读）：总期数+锚点约束下每组在所有可行排布中的最早/最晚期位
@@ -1315,6 +1422,7 @@ examples/
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
   package_reconciliation_demo.sh # 成果包交付前复核示例（三类比较/首次偏离/曾偏离保留/只读拒绝）
+  preservations_demo.sh # 争议证据临时保全示例（建立/查询不泄露凭据/多份覆盖/撤回拦截/解除/拒绝分支）
   field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
   field_package_corrections_demo.sh # 已汇入整包勘误示例（撤回+新包单事务/幂等/替换链/台账/冲突回滚/历史可查）
   client_demo.py    # Python 客户端示例
